@@ -13,5 +13,7 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=d:\\Project comp\\VS Code\\detect_cargocart_rewrite\\build"
-  ]
+  ],
+  "idf.portWin": "COM15",
+  "idf.flashType": "UART"
 }
