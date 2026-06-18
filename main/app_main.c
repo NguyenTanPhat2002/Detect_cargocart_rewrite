@@ -1,9 +1,9 @@
-#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include "my_protocol.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -14,6 +14,12 @@
 #include "esp_intr_alloc.h"
 
 #include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_system.h"
+
 /**
  * Brief:
  * 
@@ -31,7 +37,6 @@
 
 #define SENSOR_PIN        GPIO_NUM_35
 #define BUTTON_PIN        GPIO_NUM_32
-#define GPIO_INPUT_PIN_SEL ((1ULL<<SENSOR_PIN) | (1ULL<<BUTTON_PIN))
 
 #define ESP_INTR_FLAG_DEFAULT 0
 
@@ -39,6 +44,15 @@
 
 #define SENSOR_ACTIVE_LEVEL     0 // Sensor ON when IO read 0
 #define SENSOR_INACTIVE_LEVEL   1
+
+#define SENSOR_ID   0x0001
+#define DEFAULT_TIMESTAMP   0x00000000
+
+#define WIFI_SSID "MODERN SYSTEM"
+#define WIFI_PASS "Modern2025@1"
+
+#define WIFI_MAX_RETRY  5
+
 
 static TimerHandle_t detect_timer = NULL;
 static bool sensor_confirmed = false;
@@ -49,8 +63,45 @@ typedef struct{
     bool detected;
 }sensor_event_t;
 
+typedef struct
+{
+    uint8_t data[TX_FRAME_MAX_SIZE];
+    size_t len;
+    uint8_t msg_type;
+}tx_frame_t;
+
+static QueueHandle_t tx_frame_queue = NULL;
 static QueueHandle_t sensor_event_queue = NULL;
 static QueueHandle_t gpio_evt_queue = NULL;
+
+static void log_hex_frame(const uint8_t *buf, size_t len)
+{
+    if(buf == NULL || len ==0)
+    {
+        ESP_LOGW(TAG, "Empty frame");
+        return;
+    }
+
+    char line[3*256 +1];
+    size_t pos = 0;
+
+    line[0] = '\0';
+
+    for(size_t i=0; i < len && pos < sizeof(line) -4; i++)
+    {
+        int written = snprintf(&line[pos], sizeof(line) -pos, "%02X ", buf[i]);
+
+        if(written < 0 )
+        {
+            break;
+        }
+
+        pos += (size_t) written;
+    }
+
+    ESP_LOGI(TAG, "FRAME[%d]: %s", (int)len, line);
+}
+
 
 static void IRAM_ATTR gpio_isr_handler(void *arg)
 {
@@ -96,8 +147,6 @@ static void detect_timer_callback(TimerHandle_t xTimer)
             gpio_set_level(LED_STATUS,1);
 
             sensor_send_event(true);
-
-            ESP_LOGI(TAG, "sensor confirmed ON after %d ms",DELAY_DETECT);
         }
     }
 }
@@ -179,34 +228,56 @@ static bool gpio_init(void)
     // configure GPIO with the given settings.
     ESP_ERROR_CHECK(gpio_config(&io_output_config));
 
-    gpio_config_t io_input_config = {
+    gpio_config_t sensor_input_config = {
         // interrupt of rising / falling edge
         .intr_type = GPIO_INTR_ANYEDGE,
         // set as input mode
         .mode      = GPIO_MODE_INPUT,
         // bit mask of the pins that you want to set, e.g 34/35
-        .pin_bit_mask = GPIO_INPUT_PIN_SEL,
+        .pin_bit_mask = (1ULL << SENSOR_PIN),
+        // enable pull-up mode
+        .pull_up_en   = 0,
+        // disable pull-down mode
+        .pull_down_en = 0,
+    };
+    ESP_ERROR_CHECK(gpio_config(&sensor_input_config));
+
+    gpio_config_t button_input_config = {
+        // interrupt of rising / falling edge
+        .intr_type = GPIO_INTR_ANYEDGE,
+        // set as input mode
+        .mode      = GPIO_MODE_INPUT,
+        // bit mask of the pins that you want to set, e.g 34/35
+        .pin_bit_mask = (1ULL << BUTTON_PIN),
         // enable pull-up mode
         .pull_up_en   = 1,
         // disable pull-down mode
         .pull_down_en = 0,
     };
-    ESP_ERROR_CHECK(gpio_config(&io_input_config));
+    ESP_ERROR_CHECK(gpio_config(&button_input_config));
 
     // create a queue to handle gpio event from isr
     gpio_evt_queue = xQueueCreate(10,sizeof(uint32_t));
 
     sensor_event_queue = xQueueCreate(10, sizeof(sensor_event_t));
 
+    tx_frame_queue = xQueueCreate(10,sizeof(tx_frame_t));
+
     if(sensor_event_queue == NULL)
     {
-        printf("Create sensor event queue failed \n");
+        ESP_LOGE(TAG, "Create sensor event queue failed");
         return false;
     }
 
     if(gpio_evt_queue == NULL)
     {
-        printf("Create queue failed\n");
+        ESP_LOGE(TAG, "Create gpio event queue failed");
+        return false;
+    }
+
+    if(tx_frame_queue == NULL)
+    {
+        ESP_LOGE(TAG, "Create tx frame queue failed");
         return false;
     }
 
@@ -220,7 +291,7 @@ static bool gpio_init(void)
 
     if(detect_timer == NULL)
     {
-        printf("Create detect timer failed \n");
+        ESP_LOGE(TAG, "Create detect timer failed \n");
         return false;
     }
     // install gpio isr service
@@ -235,6 +306,56 @@ static bool gpio_init(void)
     return true;
 }
 
+static void tx_task(void *arg)
+{
+    tx_frame_t frame;
+
+    for(;;)
+    {
+        if(xQueueReceive(tx_frame_queue, &frame, portMAX_DELAY))
+        {
+            ESP_LOGI(TAG, "TX task received frame, msg_type = 0x%02X, len = %d", 
+                            frame.msg_type, (int)frame.len);
+
+            log_hex_frame(frame.data, frame.len);
+
+            gpio_set_level(LED_SEND_SERVER,1);
+            vTaskDelay(100);
+            gpio_set_level(LED_SEND_SERVER,0);
+        }
+    }
+}
+
+static bool tx_send_frame_to_queue(const uint8_t *frame, size_t frame_len, uint8_t msg_type)
+{
+    if(tx_frame_queue == NULL || frame == NULL || frame_len ==0)
+    {
+        return false;
+    }
+
+    if(frame_len > TX_FRAME_MAX_SIZE)
+    {
+        ESP_LOGE(TAG, "Frame too large, len = %d",frame_len);
+        return false;
+    }
+
+    tx_frame_t tx_frame;
+
+    memcpy(tx_frame.data, frame, frame_len);
+    tx_frame.len = frame_len;
+    tx_frame.msg_type = msg_type;
+
+    BaseType_t ret = xQueueSend(tx_frame_queue, &tx_frame, 0);
+
+    if(ret != pdTRUE)
+    {
+        ESP_LOGW(TAG, "tx_frame_queue full, frame lost");
+        return false;
+    }
+    return true;
+}
+
+
 static void sensor_event_task(void *arg)
 {
     sensor_event_t event;
@@ -245,12 +366,65 @@ static void sensor_event_task(void *arg)
         {
             ESP_LOGI(TAG, "Sensor event received: detected = %d", event.detected);
 
-            gpio_set_level(LED_SEND_SERVER,1);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            gpio_set_level(LED_SEND_SERVER,0);
+            uint8_t tx_buf[256];
+            size_t tx_len = 0;
+
+            bool ok = my_protocol_build_sensor_data_digital(
+                SENSOR_ID,
+                event.detected,
+                DEFAULT_TIMESTAMP,
+                tx_buf,
+                sizeof(tx_buf),
+                &tx_len
+            );
+
+            if(ok)
+            {
+                ESP_LOGI(TAG, "Build SENSOR_DATA frame OK, tx_len = %d", (int)tx_len);
+
+                tx_send_frame_to_queue(tx_buf, tx_len, MSG_SENSOR_DATA);
+            }
+            else{
+                ESP_LOGE(TAG, "Build SENSOR_DATA frame failed");
+            }
         }
     }
 }
+
+static void heartbeat_task(void *arg)
+{
+    for(;;)
+    {
+        uint8_t tx_buf[256];
+        size_t tx_len =0;
+
+        uint32_t uptime_sec = xTaskGetTickCount() / configTICK_RATE_HZ;
+
+        bool ok = my_protocol_build_heartbeat(
+            SENSOR_ID,
+            uptime_sec, 
+            BATTERY_WIRED,
+            DEFAULT_TIMESTAMP,
+            tx_buf,
+            sizeof(tx_buf),
+            &tx_len
+        );
+
+        if(ok)
+        {
+            ESP_LOGI(TAG, "Build HEARTBEAT OK, uptime = %lu, len =%d",
+                        (unsigned long)uptime_sec,
+                        (int)tx_len);
+
+            tx_send_frame_to_queue(tx_buf, tx_len, MSG_HEARTBEAT);
+        }
+        else{
+            ESP_LOGE(TAG, "Build HEARTBEAT failed");
+        }
+        vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_PERIOD_MS));
+    }
+}
+
 
 void app_main(void)
 {
@@ -262,13 +436,36 @@ void app_main(void)
     gpio_set_level(LED_STATUS,0);
     gpio_set_level(LED_SEND_SERVER,0);
 
-    xTaskCreate(gpio_task, "gpio_task_example", 2048, NULL,10, NULL);
+    xTaskCreate(gpio_task, "gpio_task_example", 4096, NULL,10, NULL);
 
-    xTaskCreate(sensor_event_task, "sensor_event_task",2048,NULL,9,NULL);
+    xTaskCreate(sensor_event_task, "sensor_event_task",4096,NULL,9,NULL);
     /*
      * Nếu lúc vừa khởi động mà sensor đã ON,
      * thì cũng phải chờ DELAY_DETECT rồi mới xác nhận.
      */
+
+    uint8_t buff_status[256];
+    size_t status_len =0;
+
+    bool status_ok = my_protocol_build_status(SENSOR_ID, SENSOR_STATUS_ON,
+                                                DEFAULT_TIMESTAMP, buff_status,
+                                                sizeof(buff_status), &status_len);
+                                            
+    if(status_ok)
+    {
+        ESP_LOGI(TAG, "Build status online OK, len = %d", status_len);
+        tx_send_frame_to_queue(buff_status, status_len, MSG_SENSOR_STATUS);
+    }
+    else{
+        ESP_LOGE(TAG, "Build status online failed");
+    }
+
+    xTaskCreate(heartbeat_task, "heartbeat task", 4096, NULL, 8, NULL);
+
+    xTaskCreate(tx_task, "tx_task", 4096, NULL, 8, NULL);
+
+
+
     int level = gpio_get_level(SENSOR_PIN);
 
     if(level == SENSOR_ACTIVE_LEVEL)
