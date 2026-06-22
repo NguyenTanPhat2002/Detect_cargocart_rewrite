@@ -9,6 +9,8 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/timers.h"
+#include "freertos/event_groups.h"
+
 
 #include "driver/gpio.h"
 #include "esp_intr_alloc.h"
@@ -48,8 +50,8 @@
 #define SENSOR_ID   0x0001
 #define DEFAULT_TIMESTAMP   0x00000000
 
-#define WIFI_SSID "MODERN SYSTEM"
-#define WIFI_PASS "Modern2025@1"
+#define WIFI_SSID "PhatBinh"
+#define WIFI_PASS "19752002"
 
 #define WIFI_MAX_RETRY  5
 #define WIFI_CONNECTED_BIT BIT0
@@ -109,7 +111,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-void wifi_init_sta(void)
+static bool wifi_init_sta(void)
 {
     s_wifi_event_group = xEventGroupCreate();
     
@@ -122,7 +124,7 @@ void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instace_got_ip;
+    esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT,
         ESP_EVENT_ANY_ID,
@@ -153,6 +155,24 @@ void wifi_init_sta(void)
     /* Wait until 1 or 2 this bit is setted: 
         1. WIFI_CONNECTED_BIT
         2. WIFI_FAIL_BIT */
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, 
+                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                            pdFALSE,
+                                            pdFALSE,
+                                            portMAX_DELAY);
+    
+    if(bits & WIFI_CONNECTED_BIT)
+    {
+        ESP_LOGI(TAG, "Connected to WIFI");
+        return true;
+    }
+    else if(bits & WIFI_FAIL_BIT)
+    {
+        ESP_LOGE(TAG, "Faied to connect WIFI");
+        return false;
+    }
+    ESP_LOGE(TAG, "Unexpected WiFi event");
+    return false;
 }
 
 static void log_hex_frame(const uint8_t *buf, size_t len)
@@ -401,7 +421,7 @@ static void tx_task(void *arg)
             log_hex_frame(frame.data, frame.len);
 
             gpio_set_level(LED_SEND_SERVER,1);
-            vTaskDelay(100);
+            vTaskDelay(pdMS_TO_TICKS(100));
             gpio_set_level(LED_SEND_SERVER,0);
         }
     }
@@ -416,7 +436,7 @@ static bool tx_send_frame_to_queue(const uint8_t *frame, size_t frame_len, uint8
 
     if(frame_len > TX_FRAME_MAX_SIZE)
     {
-        ESP_LOGE(TAG, "Frame too large, len = %d",frame_len);
+        ESP_LOGE(TAG, "Frame too large, len = %d",(int)frame_len);
         return false;
     }
 
@@ -506,9 +526,38 @@ static void heartbeat_task(void *arg)
     }
 }
 
+static bool nvs_init_app(void)
+{
+    esp_err_t ret = nvs_flash_init();
+
+    if(ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+
+    if(ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "NVS init failed");
+        return false;
+    }
+
+    return true;
+}
 
 void app_main(void)
 {
+    if(!nvs_init_app())
+    {
+        return;
+    }
+
+    if(!wifi_init_sta())
+    {
+        ESP_LOGE(TAG, "WIFI failed, stop app");
+        return;
+    }
+
     if(!gpio_init())
     {
         return;
@@ -520,6 +569,11 @@ void app_main(void)
     xTaskCreate(gpio_task, "gpio_task_example", 4096, NULL,10, NULL);
 
     xTaskCreate(sensor_event_task, "sensor_event_task",4096,NULL,9,NULL);
+    
+    xTaskCreate(heartbeat_task, "heartbeat task", 4096, NULL, 8, NULL);
+
+    xTaskCreate(tx_task, "tx_task", 4096, NULL, 8, NULL);
+
     /*
      * Nếu lúc vừa khởi động mà sensor đã ON,
      * thì cũng phải chờ DELAY_DETECT rồi mới xác nhận.
@@ -540,12 +594,6 @@ void app_main(void)
     else{
         ESP_LOGE(TAG, "Build status online failed");
     }
-
-    xTaskCreate(heartbeat_task, "heartbeat task", 4096, NULL, 8, NULL);
-
-    xTaskCreate(tx_task, "tx_task", 4096, NULL, 8, NULL);
-
-
 
     int level = gpio_get_level(SENSOR_PIN);
 
