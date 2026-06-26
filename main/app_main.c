@@ -3,6 +3,8 @@
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <errno.h>
+
 #include "my_protocol.h"
 
 #include "freertos/FreeRTOS.h"
@@ -21,6 +23,10 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_system.h"
+
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include "lwip/inet.h"
 
 /**
  * Brief:
@@ -52,6 +58,8 @@
 
 #define WIFI_SSID "PhatBinh"
 #define WIFI_PASS "19752002"
+#define SERVER_IP "192.168.1.54"
+#define SERVER_PORT 5000
 
 #define WIFI_MAX_RETRY  5
 #define WIFI_CONNECTED_BIT BIT0
@@ -94,7 +102,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         {
             esp_wifi_connect();
             s_retry_num ++;
-            ESP_LOGI(TAG, "retry to connect wifi MODERN SYSTEM");
+            ESP_LOGI(TAG, "retry to connect wifi %s",WIFI_SSID);
         }
         else{
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
@@ -114,6 +122,12 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 static bool wifi_init_sta(void)
 {
     s_wifi_event_group = xEventGroupCreate();
+
+    if(s_wifi_event_group == NULL)
+    {
+        ESP_LOGE(TAG, "Create WiFi event group failed");
+        return false;
+    }
     
     ESP_ERROR_CHECK(esp_netif_init());
 
@@ -168,7 +182,7 @@ static bool wifi_init_sta(void)
     }
     else if(bits & WIFI_FAIL_BIT)
     {
-        ESP_LOGE(TAG, "Faied to connect WIFI");
+        ESP_LOGE(TAG, "Failed to connect WIFI");
         return false;
     }
     ESP_LOGE(TAG, "Unexpected WiFi event");
@@ -234,6 +248,11 @@ static void sensor_send_event(bool detected)
     event.detected = detected;
 
     xQueueSend(sensor_event_queue, &event, 0);
+
+    if(ret != pdTRUE)
+    {
+        ESP_LOGW(TAG, "sensor_event_queue full, event lost");
+    }
 }
 
 static void detect_timer_callback(TimerHandle_t xTimer)
@@ -544,6 +563,36 @@ static bool nvs_init_app(void)
 
     return true;
 }
+static int tcp_connect_server(void)
+{
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(SERVER_PORT);
+
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+
+    if(sock < 0)
+    {
+        ESP_LOGE(TAG, "Unable to create socket, erro = %d", errno);
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "Socket created, connecting to %s:%d", SERVER_IP, SERVER_PORT);
+
+    int err = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+
+    if(err !=0 )
+    {
+        ESP_LOGE(TAG, "Socket connect faied, errno = %d", errno);
+        close(sock);
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "TCP connected to server");
+
+    return sock;
+}
 
 void app_main(void)
 {
@@ -558,6 +607,16 @@ void app_main(void)
         return;
     }
 
+    int sock = tcp_connect_server();
+
+    if(sock < 0)
+    {
+        ESP_LOGE(TAG, "TCP connect faied, stop app");
+        return;
+    }
+
+    close(sock);
+    
     if(!gpio_init())
     {
         return;
@@ -588,7 +647,7 @@ void app_main(void)
                                             
     if(status_ok)
     {
-        ESP_LOGI(TAG, "Build status online OK, len = %d", status_len);
+        ESP_LOGI(TAG, "Build status online OK, len = %d", (int)status_len);
         tx_send_frame_to_queue(buff_status, status_len, MSG_SENSOR_STATUS);
     }
     else{
